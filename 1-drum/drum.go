@@ -23,7 +23,7 @@ func (p *track) String() string {
 			s += "|"
 		}
 
-		if note != 0 {
+		if note {
 			s += "x"
 		} else {
 			s += "-"

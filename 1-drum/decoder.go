@@ -18,119 +18,151 @@ func DecodeFile(path string) (*Pattern, error) {
 	}
 	defer file.Close()
 
-	p, err := decode(file)
+	d := decoder{Reader: &errorReader{Reader: file}}
+	p := d.decode()
 
-	return p, nil
+	err = d.Reader.Err
+	if err != nil {
+		err = d.Err
+	}
+	return p, err
+}
+
+type errorReader struct {
+	Reader io.Reader
+	Err    error
+}
+
+func (r *errorReader) Read(b []byte) int {
+	var num int
+	if r.Err != nil {
+		return num
+	} else {
+		n, err := r.Reader.Read(b)
+		if err != nil {
+			r.Err = err
+		} else {
+			num = n
+		}
+	}
+	return num
+}
+
+func (r *errorReader) BinaryRead(order binary.ByteOrder, data interface{}) {
+	if r.Err != nil {
+		return
+	}
+
+	binary.Read(r.Reader, order, data)
 }
 
 type decoder struct {
-	r io.Reader
+	Reader *errorReader
+	Err    error //the first error encountered by the decoder
 }
 
-func decode(r io.Reader) (*Pattern, error) {
-	length, err := getFileLength(r)
-	if err != nil {
-		return nil, errors.New("Malformed SPLICE file, " + err.Error())
-	}
+func (d *decoder) decode() *Pattern {
+	length := d.getFileLength()
 
-	if length < 36 {
-		return nil, errors.New("Malformed SPLICE file, Header is not 50 bytes")
-	}
+	//Now that we know the length
+	//prevent reading passed the limit of the file
+	d.Reader.Reader = &io.LimitedReader{R: d.Reader.Reader, N: int64(length)}
 
 	p := &Pattern{}
-	p.Header, err = decodeHeader(r)
-	if err != nil {
-		return nil, errors.New("Error decoding Header: " + err.Error())
-	}
+	p.Header = d.decodeHeader()
 
 	//now decode the Tracks
 	p.Tracks = make([]*track, 0)
-	for i := 0; i < (length - 36); {
-		nexttrack, trackLength, err := decodeNexttrack(r)
-		if err != nil {
-			return nil, errors.New("Error decoding track" + err.Error())
-		}
-		p.Tracks = append(p.Tracks, nexttrack)
-		i += trackLength
+	t := d.decodeNexttrack()
+	for t != nil {
+		p.Tracks = append(p.Tracks, t)
+		t = d.decodeNexttrack()
 	}
-	return p, err
+	return p
 }
 
 //file length is the remaining expected number of bytes
 //This include the remaining Header (36 bytes) plus the
 //encoded data
-func getFileLength(r io.Reader) (int, error) {
+func (d *decoder) getFileLength() int {
 	p := make([]byte, 14)
-	n, err := r.Read(p)
+	n := d.Reader.Read(p)
 
 	if n >= 0 && (n < 14 || string(p[:6]) != "SPLICE") {
-		err = errors.New("'SPLICE' identifier not found")
+		d.Err = errors.New("'SPLICE' identifier not found")
+		return -1
 	}
 
-	if err != nil {
-		return -1, err
+	length := int(p[13])
+	if length < 36 {
+		d.Err = errors.New("Malformed SPLICE file, Header is not 50 bytes")
+		return -1
 	}
 
-	return int(p[13]), nil
+	return length
 }
 
 //Assumes the next 36 bytes in r are the Header bytes
 //The first 32 are ASCII characters representing the HW Version
 //The last 4 bytes correspond to a float representing the tempo
-func decodeHeader(r io.Reader) (*header, error) {
+func (d *decoder) decodeHeader() *header {
+	if d.Err != nil {
+		return nil
+	}
+
 	h := &header{}
 
 	versionBytes := make([]byte, 32)
-	_, err := r.Read(versionBytes)
-	if err != nil {
-		return nil, err
-	}
+	d.Reader.Read(versionBytes)
 	h.Version = strings.Trim(string(versionBytes), string(byte(0)))
 
-	err = binary.Read(r, binary.LittleEndian, &h.Tempo)
-	if err != nil {
-		return nil, err
-	}
-	return h, nil
+	d.Reader.BinaryRead(binary.LittleEndian, &h.Tempo)
+
+	return h
 }
 
-func decodeNexttrack(r io.Reader) (*track, int, error) {
+func (d *decoder) decodeNexttrack() *track {
+	if d.Err != nil {
+		return nil
+	}
+
 	t := &track{}
 
 	//First byte is the id of the track
-	var idByte byte
-	err := binary.Read(r, binary.LittleEndian, &idByte)
-	if err != nil {
-		return nil, -1, err
-	}
-	t.ID = int(idByte)
+	idByte := make([]byte, 1)
+	d.Reader.Read(idByte)
+	t.ID = int(idByte[0])
 
 	//Then there are 3 blank bytes
-	var throwAway [3]byte
-	err = binary.Read(r, binary.LittleEndian, &throwAway)
-	if err != nil {
-		return nil, -1, err
-	}
+	throwAway := make([]byte, 3)
+	d.Reader.Read(throwAway)
 
 	//The next byte is the legnth of the track's name
-	var nameLength byte
-	err = binary.Read(r, binary.BigEndian, &nameLength)
+	nameLength := make([]byte, 1)
+	d.Reader.Read(nameLength)
 
 	//Now parse the track's name
-	nameRaw := make([]byte, nameLength)
-	_, err = r.Read(nameRaw)
-	if err != nil {
-		return nil, -1, err
-	}
+	nameRaw := make([]byte, int(nameLength[0]))
+	d.Reader.Read(nameRaw)
 	t.Name = string(nameRaw)
 
 	//Finally, the next 16 bytes represent the measure
-	err = binary.Read(r, binary.BigEndian, &t.Bars)
-	if err != nil {
-		return nil, -1, err
+	rawNotes := make([]byte, 16)
+	d.Reader.Read(rawNotes)
+
+	for i, note := range rawNotes {
+		if note != 0 {
+			t.Bars[i] = true
+		} else {
+			t.Bars[i] = false
+		}
 	}
 
-	return t, (1 + 3 + 1 + len(t.Name) + 16), nil
+	if d.Reader.Err != nil {
+		return nil
+	} else {
+		return t
+	}
 }
 
 //Pattern is a High level representation of the drum pattern
@@ -150,5 +182,5 @@ type header struct {
 type track struct {
 	Name string
 	ID   int
-	Bars [16]byte
+	Bars [16]bool
 }
